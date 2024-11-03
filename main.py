@@ -45,7 +45,7 @@ async def enroll(data: EnrollmentData, db: Session = Depends(get_db)):
 
         # Segment into windows of 200 samples
         try:
-            segments = segment_signal(processed_ecg, window_size=200, max_segments=40)
+            segments = segment_signal(processed_ecg, window_size=200, max_segments=30)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -74,7 +74,7 @@ async def enroll(data: EnrollmentData, db: Session = Depends(get_db)):
             user_id=data.user_id,
             name=data.name,
             embedding=encrypted_iECG,
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(),
         )
         db.add(new_user)
         db.commit()
@@ -101,7 +101,7 @@ async def authenticate(data: ECGData, db: Session = Depends(get_db)):
         processed_ecg = preprocess_ecg_series(data.ecg_data)
         
         # Segment into windows of 200 samples
-        segments = segment_signal(processed_ecg, window_size=200, max_segments=30)
+        segments = segment_signal(processed_ecg, window_size=200, max_segments=15)
         
         # Generate embeddings for each segment
         context_vectors = []
@@ -116,14 +116,11 @@ async def authenticate(data: ECGData, db: Session = Depends(get_db)):
         if not context_vectors:
             raise HTTPException(status_code=500, detail="Failed to generate embeddings")
         
-        # Calculate mean embedding
-        incoming_embedding = np.mean(context_vectors, axis=0)
-        
-        # Compare with stored templates
-        threshold = 0.4
-        best_similarity = 0.0
+        # Set similarity threshold and initialize variables
+        threshold = 0.4  # Threshold for cosine similarity
         best_user_name = None
-        
+        best_match_count = 0
+
         users = db.query(User).all()
         for user in users:
             # Decrypt the stored embedding
@@ -134,25 +131,32 @@ async def authenticate(data: ECGData, db: Session = Depends(get_db)):
             except Exception as e:
                 logging.error(f"Error decrypting or processing stored embedding for user {user.name}: {str(e)}")
                 continue
-            
-            # Calculate similarity
-            similarity_score = cosine_similarity([incoming_embedding], [stored_embedding])[0, 0]
-            logging.info(f"Similarity score for user {user.name}: {similarity_score}")
 
-            if similarity_score > best_similarity:
-                best_similarity = similarity_score
+            # Compare each context vector to the stored embedding
+            match_count = 0
+            for context_vector in context_vectors:
+                similarity_score = cosine_similarity([context_vector], [stored_embedding])[0, 0]
+                if similarity_score > threshold:
+                    match_count += 1
+
+            # Check if more than 50% of context vectors match
+            if match_count > len(context_vectors) / 2:
                 best_user_name = user.name
-        
-        if best_similarity >= threshold:
+                best_match_count = match_count
+                break  # Stop searching as soon as we find a matching user
+
+        if best_user_name:
             return {
                 "message": "Authentication successful",
                 "name": best_user_name,
-                "similarity_score": float(best_similarity)
+                "matching_segments": best_match_count,
+                "total_segments": len(context_vectors),
+                "match_percentage": best_match_count / len(context_vectors) * 100
             }
         else:
             raise HTTPException(
                 status_code=401,
-                detail=f"Authentication failed (best similarity: {best_similarity:.3f})"
+                detail="Authentication failed: less than 50% of segments matched."
             )
             
     except Exception as e:
